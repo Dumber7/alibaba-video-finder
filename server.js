@@ -10,7 +10,8 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors());
-app.use(express.static(path.join(__dirname, "public")));
+
+// ---------- API FIRST ----------
 
 function unique(arr) {
   return [...new Set(arr)];
@@ -47,12 +48,10 @@ app.get("/extract", async (req, res) => {
 
   const page = await context.newPage();
 
-  // Stealth-ish: remove webdriver flag
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
   });
 
-  // Capture any mp4/m3u8 that DO get requested
   const videos = new Set();
   page.on("response", (resp) => {
     const url = resp.url();
@@ -63,62 +62,34 @@ app.get("/extract", async (req, res) => {
     await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await page.waitForTimeout(2500);
 
-    // 1) Click "Video" tab if tabs exist (several possible Alibaba layouts)
+    // click "Video" tab if present
     await page.evaluate(() => {
       const lower = (s) => (s || "").trim().toLowerCase();
-
       const candidates = [
-        ...document.querySelectorAll(
-          '[role="tab"], button, a, div, span'
-        ),
+        ...document.querySelectorAll('[role="tab"], button, a, div, span'),
       ];
-
       const tab = candidates.find((el) => lower(el.textContent) === "video");
       if (tab) tab.click();
     });
 
     await page.waitForTimeout(3000);
 
-    // 2) Scroll + try to trigger lazy gallery loads multiple times
+    // scroll to trigger lazy loads
     for (let i = 0; i < 3; i++) {
       await page.mouse.wheel(0, 1600);
       await page.waitForTimeout(2000);
     }
 
-    // 3) Try clicking any visible play buttons / poster frames
+    // try to start any videos
     await page.evaluate(() => {
-      const clickIf = (el) => {
-        try { el.click(); } catch {}
-      };
-
-      const playButtons = [
-        ...document.querySelectorAll(
-          'button, div, span, i, svg'
-        ),
-      ].filter((el) => {
-        const t = (el.textContent || "").toLowerCase();
-        const cls = (el.className || "").toLowerCase();
-        return (
-          t.includes("play") ||
-          cls.includes("play") ||
-          cls.includes("video")
-        );
-      });
-
-      playButtons.slice(0, 6).forEach(clickIf);
-
-      // also try any <video> tags
       document.querySelectorAll("video").forEach((v) => {
-        try {
-          v.muted = true;
-          v.play();
-        } catch {}
+        try { v.muted = true; v.play(); } catch {}
       });
     });
 
     await page.waitForTimeout(5000);
 
-    // 4) Fallback: scan HTML for direct mp4/m3u8 links
+    // fallback scrape from HTML
     const html = await page.content();
     const htmlVideos = extractFromHtml(html);
 
@@ -148,19 +119,27 @@ app.get("/download", async (req, res) => {
     const filename =
       (new URL(url).pathname.split("/").pop() || "video.mp4").split("?")[0];
 
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${filename}"`
-    );
-    res.setHeader(
-      "Content-Type",
-      r.headers.get("content-type") || "video/mp4"
-    );
-
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Type", r.headers.get("content-type") || "video/mp4");
     r.body.pipe(res);
   } catch {
     res.status(500).send("Download proxy error");
   }
+});
+
+// ---------- STATIC LAST ----------
+
+// serve your public folder
+app.use(express.static(path.join(__dirname, "public")));
+
+// explicit home route so static never freaks out
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+// nicer 404 instead of stack spam
+app.use((req, res) => {
+  res.status(404).send("Not found");
 });
 
 app.listen(3000, () => console.log("Server running on port 3000"));
