@@ -12,13 +12,16 @@ const app = express();
 app.use(cors());
 app.use(express.static(path.join(__dirname, "public")));
 
-/**
- * Extract any PUBLIC video URLs that Alibaba loads:
- * - clicks the "Video" tab if it exists
- * - scrolls to trigger lazy loading
- * - tries to play <video> tags
- * - listens to network responses for .mp4 / .m3u8
- */
+function unique(arr) {
+  return [...new Set(arr)];
+}
+
+function extractFromHtml(html) {
+  const mp4s = html.match(/https?:\/\/[^"'\\s<>]+\.mp4[^"'\\s<>]*/gi) || [];
+  const m3u8s = html.match(/https?:\/\/[^"'\\s<>]+\.m3u8[^"'\\s<>]*/gi) || [];
+  return unique([...mp4s, ...m3u8s]);
+}
+
 app.get("/extract", async (req, res) => {
   const pageUrl = req.query.url;
   if (!pageUrl || !pageUrl.startsWith("http")) {
@@ -26,11 +29,12 @@ app.get("/extract", async (req, res) => {
   }
 
   const browser = await chromium.launch({
-    headless: false, // Alibaba blocks headless often
+    headless: true,
     args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
       "--disable-blink-features=AutomationControlled",
-      "--disable-web-security",
-      "--disable-features=IsolateOrigins,site-per-process",
     ],
   });
 
@@ -38,80 +42,99 @@ app.get("/extract", async (req, res) => {
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     viewport: { width: 1280, height: 900 },
-    bypassCSP: true
+    locale: "en-GB",
   });
 
   const page = await context.newPage();
 
-  // simple stealth: remove webdriver flag
+  // Stealth-ish: remove webdriver flag
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
   });
 
+  // Capture any mp4/m3u8 that DO get requested
   const videos = new Set();
-
   page.on("response", (resp) => {
     const url = resp.url();
-    if (url.includes(".mp4")) videos.add(url);
-    if (url.includes(".m3u8")) videos.add(url);
+    if (url.includes(".mp4") || url.includes(".m3u8")) videos.add(url);
   });
 
   try {
-    await page.goto(pageUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 60000,
-    });
-
-    // let the UI settle
+    await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await page.waitForTimeout(2500);
 
-    // IMPORTANT: click the Video tab if the listing uses tabs
+    // 1) Click "Video" tab if tabs exist (several possible Alibaba layouts)
     await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll("button, a, div, span"));
-      const videoTab = els.find(el =>
-        el.textContent &&
-        el.textContent.trim().toLowerCase() === "video"
-      );
-      if (videoTab) videoTab.click();
+      const lower = (s) => (s || "").trim().toLowerCase();
+
+      const candidates = [
+        ...document.querySelectorAll(
+          '[role="tab"], button, a, div, span'
+        ),
+      ];
+
+      const tab = candidates.find((el) => lower(el.textContent) === "video");
+      if (tab) tab.click();
     });
 
-    // wait for video player to mount + requests to fire
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(3000);
 
-    // scroll a bit to trigger lazy loads
-    await page.mouse.wheel(0, 1800);
-    await page.waitForTimeout(2500);
+    // 2) Scroll + try to trigger lazy gallery loads multiple times
+    for (let i = 0; i < 3; i++) {
+      await page.mouse.wheel(0, 1600);
+      await page.waitForTimeout(2000);
+    }
 
-    // try to autoplay any HTML5 videos
+    // 3) Try clicking any visible play buttons / poster frames
     await page.evaluate(() => {
-      document.querySelectorAll("video").forEach(v => {
+      const clickIf = (el) => {
+        try { el.click(); } catch {}
+      };
+
+      const playButtons = [
+        ...document.querySelectorAll(
+          'button, div, span, i, svg'
+        ),
+      ].filter((el) => {
+        const t = (el.textContent || "").toLowerCase();
+        const cls = (el.className || "").toLowerCase();
+        return (
+          t.includes("play") ||
+          cls.includes("play") ||
+          cls.includes("video")
+        );
+      });
+
+      playButtons.slice(0, 6).forEach(clickIf);
+
+      // also try any <video> tags
+      document.querySelectorAll("video").forEach((v) => {
         try {
           v.muted = true;
           v.play();
-        } catch (e) {}
+        } catch {}
       });
     });
 
-    // wait for network captures
     await page.waitForTimeout(5000);
 
-    const list = [...videos];
-    await browser.close();
+    // 4) Fallback: scan HTML for direct mp4/m3u8 links
+    const html = await page.content();
+    const htmlVideos = extractFromHtml(html);
 
-    return res.json({ pageUrl, videos: list });
+    const all = unique([...videos, ...htmlVideos]);
+
+    await browser.close();
+    return res.json({ pageUrl, videos: all });
   } catch (err) {
     await browser.close();
     return res.status(500).json({
-      error: "Failed to load/extract",
+      error: "Failed to extract",
       detail: String(err),
     });
   }
 });
 
-/**
- * Download proxy to avoid CORS issues.
- * Frontend hits /download?url=MP4_URL
- */
 app.get("/download", async (req, res) => {
   const url = req.query.url;
   if (!url || !url.startsWith("http")) {
@@ -135,11 +158,9 @@ app.get("/download", async (req, res) => {
     );
 
     r.body.pipe(res);
-  } catch (err) {
+  } catch {
     res.status(500).send("Download proxy error");
   }
 });
 
-app.listen(3000, () => {
-  console.log("Server running on port 3000");
-});
+app.listen(3000, () => console.log("Server running on port 3000"));
